@@ -1,0 +1,23 @@
+debug = true
+
+[db]
+user = "someone"
+passwd = "hard to guess"
+host = "10.81.32.179"
+port = "27018"
+table = "entropy"
+
+[fetcher]
+timeout = 10
+host = ""
+concurrency = 50
+
+[packer]
+block_size = 4096
+
+[sender]
+timeout = 5
+private_key = "private key"
+mch_id = "mch id"
+ledger_id = "ledger id"
+chain_id = "test chain"
