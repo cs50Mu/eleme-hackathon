@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,6 +24,8 @@ var mu sync.Mutex
 
 const maxFoodsInCart = 3
 
+var scriptSha string
+
 // health check
 func checkHealth(c *gin.Context) {
 	c.String(http.StatusOK, "pong")
@@ -34,14 +37,34 @@ type loginForm struct {
 }
 
 var redisClient *redis.Client
+var scriptMapping map[string]string
 
 func init() {
 	redisClient = redis.NewClient(&redis.Options{
-//		Addr:     "127.0.0.1:6379",
+		//Addr: "127.0.0.1:6379",
 		Addr:     "10.0.2.2:6379",
 		Password: "",
 		DB:       1,
 	})
+
+	// load lua scripts
+	scriptMapping = make(map[string]string)
+	loadLuaScript("lua/add_food.lua", "add_food")
+	loadLuaScript("lua/place_order.lua", "place_order")
+}
+
+func loadLuaScript(scriptPath, scriptName string) {
+	script := readFile(scriptPath)
+	scriptSha, _ = redisClient.ScriptLoad(script).Result()
+	scriptMapping[scriptName] = scriptSha
+}
+
+func readFile(filename string) string {
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		panic(err)
+	}
+	return string(content)
 }
 
 func validateBody(data []byte, v interface{}) (bool, map[string]string) {
@@ -151,29 +174,29 @@ func login(c *gin.Context) {
 func getFoods(c *gin.Context) {
 	//userName := c.MustGet("userName").(string)
 	// return foods
-	foodIDs, err := redisClient.SMembers("foods").Result()
-	if err != nil {
-		panic(err)
-	}
-	var res []map[string]int
-	for _, foodID := range foodIDs {
-		foodKey := fmt.Sprintf("food:%s", foodID)
-		foodMap, err := redisClient.HGetAll(foodKey).Result()
-		if err != nil {
-			panic(err)
-		}
-		priceStr, stockStr := foodMap["price"], foodMap["stock"]
-		id, _ := strconv.Atoi(foodID)
-		price, _ := strconv.Atoi(priceStr)
-		stock, _ := strconv.Atoi(stockStr)
-		foodObj := map[string]int{
-			"id":    id,
-			"price": price,
-			"stock": stock,
-		}
-		res = append(res, foodObj)
-	}
-	c.JSON(http.StatusOK, res)
+	//	foodIDs, err := redisClient.SMembers("foods").Result()
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	var res []map[string]int
+	//	for _, foodID := range foodIDs {
+	//		foodKey := fmt.Sprintf("food:%s", foodID)
+	//		foodMap, err := redisClient.HGetAll(foodKey).Result()
+	//		if err != nil {
+	//			panic(err)
+	//		}
+	//		priceStr, stockStr := foodMap["price"], foodMap["stock"]
+	//		id, _ := strconv.Atoi(foodID)
+	//		price, _ := strconv.Atoi(priceStr)
+	//		stock, _ := strconv.Atoi(stockStr)
+	//		foodObj := map[string]int{
+	//			"id":    id,
+	//			"price": price,
+	//			"stock": stock,
+	//		}
+	//		res = append(res, foodObj)
+	//	}
+	c.JSON(http.StatusOK, "")
 }
 
 func generateCartID() string {
@@ -184,34 +207,25 @@ func generateCartID() string {
 func createCart(c *gin.Context) {
 	userID := c.MustGet("userID").(string)
 	cartID := generateCartID()
-	userCartKey := fmt.Sprintf("%s.%s", userID, cartID)
-	// user.cartID
-	err := redisClient.HSet(userCartKey, "total", 0).Err()
-	if err != nil {
-		panic(err)
-	}
-	// add cartID to set
-	err = redisClient.SAdd("carts", cartID).Err()
-	if err != nil {
-		panic(err)
-	}
+	go func() {
+		userCartKey := fmt.Sprintf("%s.%s", userID, cartID)
+		// user.cartID
+		err := redisClient.HSet(userCartKey, "total", 0).Err()
+		if err != nil {
+			panic(err)
+		}
+		// add cartID to set
+		err = redisClient.SAdd("carts", cartID).Err()
+		if err != nil {
+			panic(err)
+		}
+	}()
 	c.JSON(http.StatusOK, gin.H{"cart_id": cartID})
 }
 
 type addFoodForm struct {
 	FoodID int `json:"food_id"`
 	Count  int `json:"count"`
-}
-
-func isFood(foodID int) bool {
-	isExist, err := redisClient.SIsMember("foods", foodID).Result()
-	if err != nil {
-		panic(err)
-	}
-	if isExist {
-		return true
-	}
-	return false
 }
 
 // add food
@@ -226,64 +240,28 @@ func addFood(c *gin.Context) {
 	}
 	foodID := addFoodData.FoodID
 	foodCount := addFoodData.Count
-	if !isFood(foodID) {
+	cartID := c.Param("cart_id")
+	keys := make([]string, 0)
+	retCode, err := redisClient.EvalSha(scriptMapping["add_food"], keys, foodID, foodCount, cartID, userID).Int64()
+	if err != nil {
+		panic(err)
+	}
+	switch retCode {
+	case -1:
 		c.JSON(http.StatusNotFound, gin.H{"code": "FOOD_NOT_FOUND",
 			"message": "食物不存在"})
-		return
-	}
-	cartID := c.Param("cart_id")
-	isExist, err := redisClient.SIsMember("carts", cartID).Result()
-	if err != nil {
-		panic(err)
-	}
-	if !isExist {
+	case -2:
 		c.JSON(http.StatusNotFound, gin.H{"code": "CART_NOT_FOUND",
 			"message": "篮子不存在"})
-		return
-	}
-	userCartKey := fmt.Sprintf("%s.%s", userID, cartID)
-	resp, err := redisClient.Exists(userCartKey).Result()
-	if err != nil {
-		panic(err)
-	}
-	if resp != int64(1) {
+	case -3:
 		c.JSON(http.StatusUnauthorized, gin.H{"code": "NOT_AUTHORIZED_TO_ACCESS_CART",
 			"message": "无权限访问指定的篮子"})
-		return
-	}
-
-	foodTotal, err := redisClient.HGet(userCartKey, "total").Int64()
-	if err != nil {
-		panic(err)
-	}
-	if int(foodTotal)+foodCount > maxFoodsInCart {
+	case -4:
 		c.JSON(http.StatusForbidden, gin.H{"code": "FOOD_OUT_OF_LIMIT",
 			"message": "篮子中食物数量超过了三个"})
-		return
+	default:
+		c.JSON(http.StatusNoContent, "")
 	}
-
-	// normal logic
-	foodIDKey := fmt.Sprintf("id:%d", foodID)
-	isExist, err = redisClient.HExists(userCartKey, foodIDKey).Result()
-	if err != nil {
-		panic(err)
-	}
-	if isExist {
-		err = redisClient.HIncrBy(userCartKey, foodIDKey, int64(foodCount)).Err()
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		err = redisClient.HSet(userCartKey, foodIDKey, foodCount).Err()
-		if err != nil {
-			panic(err)
-		}
-	}
-	err = redisClient.HIncrBy(userCartKey, "total", int64(foodCount)).Err()
-	if err != nil {
-		panic(err)
-	}
-	c.JSON(http.StatusNoContent, "")
 }
 
 type orderForm struct {
@@ -305,76 +283,35 @@ func placeOrder(c *gin.Context) {
 		return
 	}
 	cartID := orderData.CartID
-	isExist, err := redisClient.SIsMember("carts", cartID).Result()
+	orderID := generateOrderID()
+	keys := make([]string, 0)
+	retCode, err := redisClient.EvalSha(scriptMapping["place_order"], keys, userID, cartID, orderID).Int64()
 	if err != nil {
 		panic(err)
 	}
-	if !isExist {
+	switch retCode {
+	case -1:
 		c.JSON(http.StatusNotFound, gin.H{"code": "CART_NOT_FOUND",
 			"message": "篮子不存在"})
-		return
-	}
-	userCartKey := fmt.Sprintf("%s.%s", userID, cartID)
-	resp, err := redisClient.Exists(userCartKey).Result()
-	if err != nil {
-		panic(err)
-	}
-	if resp != int64(1) {
+	case -2:
 		c.JSON(http.StatusUnauthorized, gin.H{"code": "NOT_AUTHORIZED_TO_ACCESS_CART",
 			"message": "无权限访问指定的篮子"})
-		return
-	}
-	_, err = redisClient.HGet("orders", userID).Result()
-	if err != nil {
-		if err != redis.Nil {
-			panic(err)
-		}
-	} else {
+	case -3:
 		c.JSON(http.StatusForbidden, gin.H{"code": "ORDER_OUT_OF_LIMIT",
 			"message": "每个用户只能下一单"})
-		return
-	}
-	// deduct food stock
-	orderID := generateOrderID()
-	kvs, err := redisClient.HGetAll(userCartKey).Result()
-	if err != nil {
-		panic(err)
-	}
-	for k, v := range kvs {
-		if k != "total" {
-			splitted := strings.Split(k, ":")
-			foodID := splitted[1]
-			foodCount, _ := strconv.Atoi(v)
-			// lock
-			mu.Lock()
-			foodKey := fmt.Sprintf("food:%s", foodID)
-			stockStr, err := redisClient.HGet(foodKey, "stock").Result()
+	case -4:
+		c.JSON(http.StatusForbidden, gin.H{"code": "FOOD_OUT_OF_STOCK",
+			"message": "食物库存不足"})
+	default:
+		// 成功扣减后再记录订单
+		go func() {
+			err = redisClient.HSet("orders", userID, orderID).Err()
 			if err != nil {
 				panic(err)
 			}
-			stock, _ := strconv.Atoi(stockStr)
-			if foodCount > stock {
-				c.JSON(http.StatusForbidden, gin.H{"code": "FOOD_OUT_OF_STOCK",
-					"message": "食物库存不足"})
-				mu.Unlock()
-				return
-			}
-			redisClient.HIncrBy(foodKey, "stock", int64(-foodCount))
-			mu.Unlock()
-			orderKey := fmt.Sprintf("order:%s", orderID)
-			// create order info based on cart info
-			err = redisClient.HSet(orderKey, foodID, foodCount).Err()
-			if err != nil {
-				panic(err)
-			}
-		}
+		}()
+		c.JSON(http.StatusOK, gin.H{"id": orderID})
 	}
-	// 成功扣减后再记录订单
-	err = redisClient.HSet("orders", userID, orderID).Err()
-	if err != nil {
-		panic(err)
-	}
-	c.JSON(http.StatusOK, gin.H{"id": orderID})
 }
 
 // get order
