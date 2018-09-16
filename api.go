@@ -1,8 +1,12 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
@@ -88,16 +92,16 @@ func authenticate() gin.HandlerFunc {
 			accessToken = c.GetHeader("Access-Token")
 		}
 		if accessToken != "" {
-			userID, err := redisClient.HGet("token:user", accessToken).Result()
-			if err != nil {
-				if err == redis.Nil {
-					c.JSON(http.StatusUnauthorized, gin.H{"code": "INVALID_ACCESS_TOKEN",
-						"message": "无效的令牌"})
-					//return
-					c.Abort()
-				} else {
-					panic(err)
-				}
+			decoded, _ := base64.URLEncoding.DecodeString(accessToken)
+			splitted := strings.Split(string(decoded), ".")
+			userID, sign := splitted[0], splitted[1]
+			h := md5.New()
+			io.WriteString(h, userID)
+			calcedSign := hex.EncodeToString(h.Sum(nil))
+			if calcedSign != sign {
+				c.JSON(http.StatusUnauthorized, gin.H{"code": "INVALID_ACCESS_TOKEN",
+					"message": "无效的令牌"})
+				c.Abort()
 			}
 			c.Set("userID", userID)
 			c.Next()
@@ -140,34 +144,14 @@ func login(c *gin.Context) {
 			"message": "用户名或密码错误"})
 		return
 	}
-	token, err := redisClient.HGet("user:token", loginData.UserName).Result()
-	if err != nil {
-		if err != redis.Nil {
-			panic(err)
-		}
-	} else {
-		// remove old token
-		err = redisClient.HDel("token:user", token).Err()
-		if err != nil {
-			panic(err)
-		}
-	}
-	accessToken := randStr(12)
+	h := md5.New()
+	io.WriteString(h, userIDStr)
+	composit := userIDStr + "." + hex.EncodeToString(h.Sum(nil))
+	accessToken := base64.URLEncoding.EncodeToString([]byte(composit))
 	userID, _ := strconv.Atoi(userIDStr)
 	c.JSON(http.StatusOK, gin.H{"user_id": userID,
 		"username":     loginData.UserName,
 		"access_token": accessToken})
-	// access_token --> user_id
-	err = redisClient.HSet("token:user", accessToken, userID).Err()
-	if err != nil {
-		panic(err)
-	}
-	// user_name -> access_token
-	err = redisClient.HSet("user:token", loginData.UserName, accessToken).Err()
-	if err != nil {
-		panic(err)
-	}
-	return
 }
 
 // get foods
